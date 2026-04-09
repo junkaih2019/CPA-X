@@ -12,6 +12,18 @@ A monitoring and management panel for **CLIProxyAPI**, featuring health checks, 
 
 > Current security posture: **all frontend export entries are removed, and main-config writeback is disabled by default**. The config area is read-only / validate-only unless you explicitly set `CLIPROXY_PANEL_CONFIG_WRITE_ENABLED=true` in `.env`.
 
+## Feature Highlights
+- Service status, health checks, resource monitoring, request statistics, and pricing display
+- Log viewing, update/ops actions, and main-config read/validate workflow
+- Scheduled auth sync: package `auth_dir` as `tar.gz` and push it to your PC/server via `scp`
+- Responsive panel for desktop/mobile with light and dark themes
+
+## Upstream And Customization Notice
+- Original upstream repository: `https://github.com/ferretgeek/CPA-X`
+- This repository is a deployment-oriented customized variant based on the upstream CPA-X project, and it is not an official upstream release branch
+- Current local improvements include the auth-sync card and API, default 12-hour auth archive transfer scheduling, and desktop UI adjustments for the top bar and resource chips
+- Before pulling upstream updates, compare local operational changes first to avoid overwriting customized behavior
+
 ## Preview
 
 ### Dark Theme
