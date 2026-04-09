@@ -11,29 +11,36 @@ import json
 import time
 import subprocess
 import threading
+import copy
 import re
 import platform
 import shutil
 import shlex
 import tempfile
 import tarfile
-from datetime import datetime, timedelta
+import ipaddress
+from datetime import datetime, timedelta, timezone
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 
 # 面板自身版本（与 GitHub Release/README 同步）
 PANEL_NAME = "CPA-X"
 PANEL_VERSION = "2.1.1"
 PRICING_BASIS_TOKENS = 1_000_000
-PRICING_BASIS_LABEL = '百万Tokens'
-PRICING_BASIS_TEXT = f'美元/{PRICING_BASIS_LABEL}'
+PRICING_BASIS_LABEL = 'Million Tokens'
+PRICING_BASIS_TEXT = f'USD/{PRICING_BASIS_LABEL}'
 
 # ==================== 预编译正则表达式 ====================
 # 日志格式: [2026-01-17 05:21:09] [--------] [info ] [gin_logger.go:92] 200 |            0s |       127.0.0.1 | GET     "/v1/models"
 REQUEST_LOG_PATTERN = re.compile(
-    r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*\[gin_logger\.go:\d+\]\s+(\d+)\s+\|\s+(\S+)\s+\|([\d\s.]+)\|\s+(\w+)\s+"([^"]+)"'
+    r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*\[gin_logger\.go:\d+\]\s+(\d+)\s+\|\s+(\S+)\s+\|\s+([0-9a-fA-F:.%\s]+)\|\s+(\w+)\s+"([^"]+)"'
+)
+USAGE_DETAIL_TIMESTAMP_PATTERN = re.compile(
+    r'^(?P<main>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<fraction>\.\d+)?(?P<tz>Z|[+-]\d{2}:\d{2})?$'
 )
 HASH_VERSION_PATTERN = re.compile(r'^[0-9a-f]{7,40}$', re.IGNORECASE)
 EXCLUDED_LOG_PATHS = (
@@ -41,6 +48,19 @@ EXCLUDED_LOG_PATHS = (
     '"/v0/management/',
     '"/v1/models"',
 )
+EXCLUDED_REQUEST_PATH_PREFIXES = tuple(path.strip('"') for path in EXCLUDED_LOG_PATHS)
+TOP_CLIENT_IP_LIMIT = 5
+TOP_CLIENT_LOG_LINES = 5000
+MAX_MONITORED_IPS = 5
+IP_MONITOR_CACHE_SECONDS = 10
+IP_CONNECTIVITY_CACHE_SECONDS = 15
+IP_LOCATION_CACHE_SECONDS = 86400
+REQUEST_STATS_RANGE_META = {
+    '24h': {'label': '过去24小时', 'hours': 24},
+    '7h': {'label': '过去7小时', 'hours': 7},
+    'all': {'label': '全部时间', 'hours': None},
+}
+REQUEST_STATS_RANGE_ORDER = ('24h', '7h', 'all')
 
 # 可选依赖
 try:
@@ -59,6 +79,8 @@ except ImportError:
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app)
+# Trust the local nginx reverse proxy so Flask sees the real client IP/proto/host.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # 配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -96,6 +118,18 @@ CONFIG = {
     # 默认监听全部网卡，保持面板部署后可从局域网访问；如需仅本机访问，可显式设置为 127.0.0.1
     'bind_host': '0.0.0.0',
     'panel_access_key': '',
+    'monitored_ips': '',
+    'auth_sync_enabled': False,
+    'auth_sync_interval_seconds': 43200,
+    'auth_sync_target_host': '',
+    'auth_sync_target_port': 22,
+    'auth_sync_target_user': '',
+    'auth_sync_target_path': '',
+    'auth_sync_ssh_key_path': '',
+    'auth_sync_strict_host_key_checking': False,
+    'auth_sync_known_hosts_path': '',
+    'auth_sync_archive_prefix': 'cpa-auth',
+    'auth_sync_status_path': os.path.join(DATA_DIR, 'auth_sync_status.json'),
 }
 
 ENV_PREFIX = 'CLIPROXY_PANEL_'
@@ -111,6 +145,10 @@ CONFIG_TYPES = {
     'pricing_output': float,
     'pricing_cache': float,
     'pricing_auto_enabled': bool,
+    'auth_sync_enabled': bool,
+    'auth_sync_interval_seconds': int,
+    'auth_sync_target_port': int,
+    'auth_sync_strict_host_key_checking': bool,
 }
 
 
@@ -125,6 +163,11 @@ def _panel_access_key_provided() -> str:
         or request.cookies.get('panel_key')
         or ''
     ).strip()
+
+
+def _request_client_ip() -> str:
+    client_ip = str(request.remote_addr or '').strip()
+    return client_ip or 'unknown'
 
 
 @app.before_request
@@ -167,6 +210,69 @@ def _parse_float(value, default=0.0):
         return float(value)
     except Exception:
         return default
+
+
+def _split_target_values(raw_value):
+    if isinstance(raw_value, (list, tuple, set)):
+        values = [str(item).strip() for item in raw_value]
+    else:
+        values = re.split(r'[\s,;]+', str(raw_value or ''))
+    return [value for value in values if value]
+
+
+def _parse_monitored_ip_targets(raw_value=None, limit=MAX_MONITORED_IPS):
+    values = _split_target_values(CONFIG.get('monitored_ips', '') if raw_value is None else raw_value)
+    targets = []
+    invalid = []
+    seen = set()
+
+    for value in values:
+        try:
+            normalized = ipaddress.ip_address(value).compressed
+        except ValueError:
+            invalid.append(value)
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        targets.append(normalized)
+        if len(targets) >= limit:
+            break
+
+    return targets, invalid
+
+
+def _format_monitored_ip_targets(targets):
+    return ','.join(str(target).strip() for target in targets if str(target).strip())
+
+
+def _is_excluded_request_path(path):
+    path_str = str(path or '').strip()
+    return any(path_str.startswith(prefix) for prefix in EXCLUDED_REQUEST_PATH_PREFIXES)
+
+
+def _parse_request_log_entry(line):
+    match = REQUEST_LOG_PATTERN.search(str(line or ''))
+    if not match:
+        return None
+
+    timestamp, status, duration, client_ip, method, path = match.groups()
+    path = path.strip()
+    if _is_excluded_request_path(path):
+        return None
+
+    client_ip = client_ip.strip()
+    if not client_ip:
+        return None
+
+    return {
+        'time': timestamp,
+        'status': _safe_int(status),
+        'duration': duration,
+        'client': client_ip,
+        'method': method,
+        'path': path,
+    }
 
 
 def _load_dotenv():
@@ -349,12 +455,21 @@ state = {
         'last_saved_ts': 0
     },
     'log_stats_loaded': False,
+    'auth_sync': {
+        'running': False,
+        'last_started_at': None,
+        'last_finished_at': None,
+        'last_success_at': None,
+        'last_result': None,
+    },
 }
 
 log_lock = threading.Lock()
 log_stats_lock = threading.Lock()
 stats_lock = threading.Lock()
 persistent_stats_lock = threading.Lock()
+auth_sync_state_lock = threading.Lock()
+auth_sync_run_lock = threading.Lock()
 
 # ==================== 持久化统计系统 ====================
 PERSISTENT_STATS_FIELDS = (
@@ -552,6 +667,67 @@ def save_usage_snapshot(snapshot):
         return False
 
 
+def _empty_usage_totals():
+    return {
+        'input_tokens': 0,
+        'output_tokens': 0,
+        'cached_tokens': 0,
+        'total_tokens': 0,
+    }
+
+
+def _empty_usage_requests():
+    return {
+        'total_requests': 0,
+        'success': 0,
+        'failure': 0,
+        'last_time': None,
+    }
+
+
+def _extract_usage_tokens(obj):
+    if not isinstance(obj, dict):
+        return 0, 0, 0, 0
+    tokens = obj.get('tokens') or obj.get('usage') or obj
+    input_tokens = _safe_int(tokens.get('input_tokens', tokens.get('input', tokens.get('prompt_tokens', 0))))
+    output_tokens = _safe_int(tokens.get('output_tokens', tokens.get('output', tokens.get('completion_tokens', 0))))
+    cached_tokens = _safe_int(tokens.get('cached_tokens', tokens.get('cache', 0)))
+    reasoning_tokens = _safe_int(tokens.get('reasoning_tokens', tokens.get('reasoning', 0)))
+    total_tokens = _safe_int(tokens.get('total_tokens', tokens.get('total', obj.get('total_tokens', 0))))
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens + reasoning_tokens
+    return input_tokens, output_tokens, cached_tokens, total_tokens
+
+
+def _extract_usage_detail_timestamp(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        match = USAGE_DETAIL_TIMESTAMP_PATTERN.match(text)
+        if not match:
+            return None
+        fraction = (match.group('fraction') or '')[:7]
+        tz_value = match.group('tz') or ''
+        if tz_value == 'Z':
+            tz_value = '+00:00'
+        normalized = f"{match.group('main')}{fraction}{tz_value}"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+    if parsed.tzinfo is not None:
+        try:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
 LOG_STATS_PERSIST_FIELDS = (
     'initialized',
     'offset',
@@ -650,17 +826,8 @@ def fetch_usage_snapshot(use_cache=True):
 
 
 def aggregate_usage_snapshot(snapshot):
-    totals = {
-        'input_tokens': 0,
-        'output_tokens': 0,
-        'cached_tokens': 0,
-        'total_tokens': 0,
-    }
-    reqs = {
-        'total_requests': 0,
-        'success': 0,
-        'failure': 0,
-    }
+    totals = _empty_usage_totals()
+    reqs = _empty_usage_requests()
     if not snapshot:
         return totals, reqs
 
@@ -672,19 +839,6 @@ def aggregate_usage_snapshot(snapshot):
     top_success = _safe_int(usage.get('success', usage.get('successful_requests', usage.get('success_count', 0))))
     top_failure = _safe_int(usage.get('failure', usage.get('failed_requests', usage.get('failure_count', 0))))
 
-    def extract_tokens(obj):
-        if not isinstance(obj, dict):
-            return 0, 0, 0, 0
-        tokens = obj.get('tokens') or obj.get('usage') or obj
-        input_tokens = _safe_int(tokens.get('input_tokens', tokens.get('input', tokens.get('prompt_tokens', 0))))
-        output_tokens = _safe_int(tokens.get('output_tokens', tokens.get('output', tokens.get('completion_tokens', 0))))
-        cached_tokens = _safe_int(tokens.get('cached_tokens', tokens.get('cache', 0)))
-        reasoning_tokens = _safe_int(tokens.get('reasoning_tokens', tokens.get('reasoning', 0)))
-        total_tokens = _safe_int(tokens.get('total_tokens', tokens.get('total', obj.get('total_tokens', 0))))
-        if total_tokens == 0:
-            total_tokens = input_tokens + output_tokens + reasoning_tokens
-        return input_tokens, output_tokens, cached_tokens, total_tokens
-
     apis = usage.get('apis', [])
     if isinstance(apis, dict):
         apis = list(apis.values())
@@ -694,6 +848,7 @@ def aggregate_usage_snapshot(snapshot):
     sum_total = 0
     sum_success = 0
     sum_failure = 0
+    latest_request_dt = None
 
     for api in apis:
         if not isinstance(api, dict):
@@ -713,13 +868,16 @@ def aggregate_usage_snapshot(snapshot):
             details = model.get('details')
             if isinstance(details, list) and details:
                 for detail in details:
-                    input_tokens, output_tokens, cached_tokens, total_tokens = extract_tokens(detail)
+                    detail_time = _extract_usage_detail_timestamp(detail.get('timestamp') if isinstance(detail, dict) else None)
+                    if detail_time and (latest_request_dt is None or detail_time > latest_request_dt):
+                        latest_request_dt = detail_time
+                    input_tokens, output_tokens, cached_tokens, total_tokens = _extract_usage_tokens(detail)
                     totals['input_tokens'] += input_tokens
                     totals['output_tokens'] += output_tokens
                     totals['cached_tokens'] += cached_tokens
                     totals['total_tokens'] += total_tokens
             else:
-                input_tokens, output_tokens, cached_tokens, total_tokens = extract_tokens(model)
+                input_tokens, output_tokens, cached_tokens, total_tokens = _extract_usage_tokens(model)
                 totals['input_tokens'] += input_tokens
                 totals['output_tokens'] += output_tokens
                 totals['cached_tokens'] += cached_tokens
@@ -738,7 +896,121 @@ def aggregate_usage_snapshot(snapshot):
         reqs['success'] = sum_success
         reqs['failure'] = sum_failure
 
+    if latest_request_dt is not None:
+        reqs['last_time'] = latest_request_dt.strftime('%Y-%m-%d %H:%M:%S')
+
     return totals, reqs
+
+
+def build_request_stats_payload(label, count=0, success=0, failed=0, last_time=None,
+                                input_tokens=0, output_tokens=0, cached_tokens=0,
+                                usage_costs=None, pricing=None):
+    tokens = {
+        'input_tokens': _safe_int(input_tokens),
+        'output_tokens': _safe_int(output_tokens),
+        'cached_tokens': _safe_int(cached_tokens),
+    }
+    payload = {
+        'label': label,
+        'count': _safe_int(count),
+        'success': _safe_int(success),
+        'failed': _safe_int(failed),
+        'last_time': last_time,
+        'input_tokens': tokens['input_tokens'],
+        'billable_input_tokens': get_billable_input_tokens(tokens),
+        'output_tokens': tokens['output_tokens'],
+        'cached_tokens': tokens['cached_tokens'],
+        'total_tokens': tokens['input_tokens'] + tokens['output_tokens'],
+    }
+    payload['usage_costs'] = usage_costs if isinstance(usage_costs, dict) else compute_usage_costs(tokens, pricing or {})
+    return payload
+
+
+def aggregate_usage_detail_windows(snapshot, pricing, now=None):
+    results = {}
+    trackers = {}
+    now_dt = now or datetime.utcnow()
+
+    for key in REQUEST_STATS_RANGE_ORDER:
+        meta = REQUEST_STATS_RANGE_META.get(key, {})
+        hours = meta.get('hours')
+        if hours is None:
+            continue
+        trackers[key] = {
+            'label': meta.get('label', key),
+            'cutoff': now_dt - timedelta(hours=hours),
+            'totals': _empty_usage_totals(),
+            'reqs': _empty_usage_requests(),
+            'last_dt': None,
+        }
+
+    if not snapshot:
+        for key, tracker in trackers.items():
+            results[key] = build_request_stats_payload(tracker['label'], pricing=pricing)
+        return results
+
+    usage = snapshot.get('usage') if isinstance(snapshot, dict) else None
+    if not isinstance(usage, dict):
+        usage = snapshot if isinstance(snapshot, dict) else {}
+
+    apis = usage.get('apis', [])
+    if isinstance(apis, dict):
+        apis = list(apis.values())
+    if not isinstance(apis, list):
+        apis = []
+
+    for api in apis:
+        if not isinstance(api, dict):
+            continue
+        models = api.get('models', [])
+        if isinstance(models, dict):
+            models = list(models.values())
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            details = model.get('details')
+            if not isinstance(details, list) or not details:
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                detail_time = _extract_usage_detail_timestamp(detail.get('timestamp'))
+                if detail_time is None:
+                    continue
+                input_tokens, output_tokens, cached_tokens, total_tokens = _extract_usage_tokens(detail)
+                failed = bool(detail.get('failed'))
+                for tracker in trackers.values():
+                    if detail_time < tracker['cutoff']:
+                        continue
+                    tracker['reqs']['total_requests'] += 1
+                    if failed:
+                        tracker['reqs']['failure'] += 1
+                    else:
+                        tracker['reqs']['success'] += 1
+                    tracker['totals']['input_tokens'] += input_tokens
+                    tracker['totals']['output_tokens'] += output_tokens
+                    tracker['totals']['cached_tokens'] += cached_tokens
+                    tracker['totals']['total_tokens'] += total_tokens
+                    if tracker['last_dt'] is None or detail_time > tracker['last_dt']:
+                        tracker['last_dt'] = detail_time
+
+    for key, tracker in trackers.items():
+        last_time = tracker['last_dt'].strftime('%Y-%m-%d %H:%M:%S') if tracker['last_dt'] else None
+        results[key] = build_request_stats_payload(
+            tracker['label'],
+            count=tracker['reqs']['total_requests'],
+            success=tracker['reqs']['success'],
+            failed=tracker['reqs']['failure'],
+            last_time=last_time,
+            input_tokens=tracker['totals']['input_tokens'],
+            output_tokens=tracker['totals']['output_tokens'],
+            cached_tokens=tracker['totals']['cached_tokens'],
+            pricing=pricing,
+        )
+
+    return results
 
 
 def compute_usage_costs(tokens, pricing):
@@ -789,7 +1061,7 @@ def _parse_float_or_none(value):
 def _fetch_openrouter_models():
     """
     从 OpenRouter 获取模型列表（带长缓存）。
-    OpenRouter pricing 字段为“美元/Token”，本面板内部价格口径为“美元/百万Tokens”。
+    OpenRouter pricing 字段为“USD/Token”，本面板内部价格口径为“USD/Million Tokens”。
     """
     cache_key = 'openrouter_models_v1'
     cached = cache.get(cache_key, max_age=6 * 3600)
@@ -962,6 +1234,388 @@ def start_usage_snapshot_worker():
     thread.start()
 
 
+def _utcnow_iso():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        try:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _get_auth_sync_interval_seconds():
+    return max(60, _safe_int(CONFIG.get('auth_sync_interval_seconds', 43200), 43200))
+
+
+def _get_auth_sync_state_snapshot():
+    with auth_sync_state_lock:
+        return copy.deepcopy(state.get('auth_sync', {}))
+
+
+def save_auth_sync_state(snapshot=None):
+    path = CONFIG.get('auth_sync_status_path')
+    if not path:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if snapshot is None:
+            snapshot = _get_auth_sync_state_snapshot()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Warning: failed to save auth sync state: {e}")
+        return False
+
+
+def load_auth_sync_state():
+    path = CONFIG.get('auth_sync_status_path')
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return False
+        with auth_sync_state_lock:
+            current = copy.deepcopy(state.get('auth_sync', {}))
+            current['running'] = False
+            current['last_started_at'] = payload.get('last_started_at')
+            current['last_finished_at'] = payload.get('last_finished_at')
+            current['last_success_at'] = payload.get('last_success_at')
+            current['last_result'] = payload.get('last_result') if isinstance(payload.get('last_result'), dict) else None
+            state['auth_sync'] = current
+        return True
+    except Exception as e:
+        print(f"Warning: failed to load auth sync state: {e}")
+        return False
+
+
+def _set_auth_sync_state(persist=True, **updates):
+    with auth_sync_state_lock:
+        current = copy.deepcopy(state.get('auth_sync', {}))
+        current.update(updates)
+        state['auth_sync'] = current
+        snapshot = copy.deepcopy(current)
+    if persist:
+        save_auth_sync_state(snapshot)
+    return snapshot
+
+
+def _safe_archive_prefix(value, default='cpa-auth'):
+    prefix = re.sub(r'[^A-Za-z0-9._-]+', '-', str(value or '').strip()).strip('-')
+    return prefix or default
+
+
+def _join_remote_path(base_path, file_name):
+    base = str(base_path or '').strip()
+    if not base:
+        return file_name
+    trimmed = base.rstrip('/\\')
+    if not trimmed:
+        return f'/{file_name}' if base.startswith('/') else file_name
+    return f'{trimmed}/{file_name}'
+
+
+def validate_auth_sync_config():
+    target_host = str(CONFIG.get('auth_sync_target_host', '') or '').strip()
+    target_user = str(CONFIG.get('auth_sync_target_user', '') or '').strip()
+    target_path = str(CONFIG.get('auth_sync_target_path', '') or '').strip()
+    ssh_key_path = str(CONFIG.get('auth_sync_ssh_key_path', '') or '').strip()
+    known_hosts_path = str(CONFIG.get('auth_sync_known_hosts_path', '') or '').strip()
+    target_port = _safe_int(CONFIG.get('auth_sync_target_port', 22), 22)
+    strict_host_key_checking = _parse_bool(CONFIG.get('auth_sync_strict_host_key_checking', False))
+    auth_dir = str(CONFIG.get('auth_dir', '') or '').strip()
+    errors = []
+    warnings = []
+
+    if not auth_dir:
+        errors.append('未配置凭证目录')
+    elif not os.path.isdir(auth_dir):
+        errors.append(f'凭证目录不存在: {auth_dir}')
+
+    scp_available = command_available('scp')
+    if not scp_available:
+        errors.append('当前系统未安装 scp，无法执行回传')
+
+    if not target_host:
+        errors.append('未配置目标 PC 地址')
+    if not target_user:
+        errors.append('未配置 SSH 用户名')
+    if not target_path:
+        errors.append('未配置目标目录')
+
+    if target_port <= 0 or target_port > 65535:
+        errors.append('SSH 端口必须在 1-65535 之间')
+
+    if ssh_key_path and not os.path.exists(ssh_key_path):
+        errors.append(f'SSH 私钥不存在: {ssh_key_path}')
+    if strict_host_key_checking and known_hosts_path and not os.path.exists(known_hosts_path):
+        errors.append(f'known_hosts 文件不存在: {known_hosts_path}')
+    if not ssh_key_path:
+        warnings.append('未配置 SSH 私钥路径，默认依赖系统 SSH Agent 或默认密钥')
+    if target_path and ' ' in target_path:
+        warnings.append('目标目录包含空格时，请确认远端 SSH shell 能正确处理该路径')
+
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors,
+        'warnings': warnings,
+        'tooling': {'scp_available': scp_available},
+        'target': {
+            'host': target_host,
+            'port': target_port,
+            'user': target_user,
+            'path': target_path,
+            'ssh_key_path': ssh_key_path,
+            'strict_host_key_checking': strict_host_key_checking,
+            'known_hosts_path': known_hosts_path,
+        },
+    }
+
+
+def _build_auth_sync_remote_target(archive_name):
+    validation = validate_auth_sync_config()
+    target = validation.get('target', {})
+    remote_path = _join_remote_path(target.get('path'), archive_name)
+    remote_path_quoted = shlex.quote(remote_path)
+    return f"{target.get('user')}@{target.get('host')}:{remote_path_quoted}"
+
+
+def _create_auth_sync_archive():
+    auth_dir = str(CONFIG.get('auth_dir', '') or '').strip()
+    archive_prefix = _safe_archive_prefix(CONFIG.get('auth_sync_archive_prefix', 'cpa-auth'))
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    archive_name = f'{archive_prefix}_{timestamp}.tar.gz'
+    temp_dir = tempfile.mkdtemp(prefix='cpa-auth-sync-')
+    archive_path = os.path.join(temp_dir, archive_name)
+    arcname = os.path.basename(os.path.normpath(auth_dir)) or 'auth'
+    with tarfile.open(archive_path, 'w:gz') as tar:
+        tar.add(auth_dir, arcname=arcname)
+    return temp_dir, archive_path, archive_name, os.path.getsize(archive_path)
+
+
+def _summarize_auth_sync_status(enabled, running, validation, last_result):
+    if running:
+        return '正在回传凭证归档到远端 PC'
+    if enabled and validation.get('errors'):
+        return f"配置不完整：{validation['errors'][0]}"
+    if enabled and last_result and last_result.get('success'):
+        return '定时回传已开启，等待下一次执行'
+    if enabled and last_result and not last_result.get('success'):
+        return f"上次回传失败：{last_result.get('message') or '未知错误'}"
+    if enabled:
+        return '定时回传已开启，等待首次执行'
+    if last_result and last_result.get('success'):
+        return '定时回传已关闭，保留最近一次成功记录'
+    return '尚未启用凭证回传'
+
+
+def get_auth_sync_status():
+    validation = validate_auth_sync_config()
+    snapshot = _get_auth_sync_state_snapshot()
+    enabled = _parse_bool(CONFIG.get('auth_sync_enabled', False))
+    running = _parse_bool(snapshot.get('running', False))
+    interval_seconds = _get_auth_sync_interval_seconds()
+    now = datetime.utcnow()
+    last_finished = _parse_iso_datetime(snapshot.get('last_finished_at'))
+    next_run_at = None
+
+    if enabled and not running:
+        if last_finished is None:
+            next_run_at = now
+        else:
+            next_run_at = last_finished + timedelta(seconds=interval_seconds)
+
+    next_run_iso = next_run_at.replace(microsecond=0).isoformat() + 'Z' if next_run_at else None
+    next_run_in_seconds = None
+    due = False
+    if next_run_at is not None:
+        next_run_in_seconds = max(0, int((next_run_at - now).total_seconds()))
+        due = next_run_at <= now
+
+    last_result = snapshot.get('last_result') if isinstance(snapshot.get('last_result'), dict) else None
+    return {
+        'enabled': enabled,
+        'running': running,
+        'available': validation.get('valid', False),
+        'interval_seconds': interval_seconds,
+        'interval_minutes': max(1, int(round(interval_seconds / 60))),
+        'target': validation.get('target', {}),
+        'tooling': validation.get('tooling', {}),
+        'validation': {
+            'errors': validation.get('errors', []),
+            'warnings': validation.get('warnings', []),
+        },
+        'last_started_at': snapshot.get('last_started_at'),
+        'last_finished_at': snapshot.get('last_finished_at'),
+        'last_success_at': snapshot.get('last_success_at'),
+        'last_result': last_result,
+        'schedule': {
+            'next_run_at': next_run_iso,
+            'next_run_in_seconds': next_run_in_seconds,
+            'due': due,
+        },
+        'summary': _summarize_auth_sync_status(enabled, running, validation, last_result),
+        'note': '目标 PC 需要开启 SSH 服务，并确保目标目录已存在。',
+    }
+
+
+def perform_auth_sync(trigger='manual'):
+    if not auth_sync_run_lock.acquire(blocking=False):
+        return {
+            'success': False,
+            'trigger': trigger,
+            'message': '已有凭证回传任务正在执行',
+        }
+
+    started_at = _utcnow_iso()
+    started_ts = time.time()
+    previous_state = _get_auth_sync_state_snapshot()
+    _set_auth_sync_state(running=True, last_started_at=started_at)
+
+    temp_dir = None
+    archive_name = None
+    archive_size = 0
+    result = None
+
+    try:
+        validation = validate_auth_sync_config()
+        if not validation.get('valid'):
+            result = {
+                'success': False,
+                'trigger': trigger,
+                'started_at': started_at,
+                'finished_at': _utcnow_iso(),
+                'duration_seconds': max(0, int(round(time.time() - started_ts))),
+                'message': validation['errors'][0],
+                'errors': validation['errors'],
+                'warnings': validation.get('warnings', []),
+            }
+            return result
+
+        target = validation.get('target', {})
+        temp_dir, archive_path, archive_name, archive_size = _create_auth_sync_archive()
+        remote_target = _build_auth_sync_remote_target(archive_name)
+
+        cmd = [
+            'scp',
+            '-q',
+            '-P',
+            str(target.get('port', 22)),
+            '-o',
+            'BatchMode=yes',
+            '-o',
+            'ConnectTimeout=15',
+        ]
+        ssh_key_path = target.get('ssh_key_path')
+        if ssh_key_path:
+            cmd.extend(['-i', ssh_key_path])
+        if target.get('strict_host_key_checking'):
+            cmd.extend(['-o', 'StrictHostKeyChecking=yes'])
+            known_hosts_path = target.get('known_hosts_path')
+            if known_hosts_path:
+                cmd.extend(['-o', f'UserKnownHostsFile={known_hosts_path}'])
+        else:
+            cmd.extend(['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null'])
+        cmd.extend([archive_path, remote_target])
+
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        finished_at = _utcnow_iso()
+        success = completed.returncode == 0
+        stderr_text = str(completed.stderr or '').strip()
+        stdout_text = str(completed.stdout or '').strip()
+        message = (
+            f'已将 {archive_name} 回传到 {target.get("user")}@{target.get("host")}:{target.get("path")}'
+            if success else
+            (stderr_text or stdout_text or 'scp 执行失败')
+        )
+        result = {
+            'success': success,
+            'trigger': trigger,
+            'started_at': started_at,
+            'finished_at': finished_at,
+            'duration_seconds': max(0, int(round(time.time() - started_ts))),
+            'archive_name': archive_name,
+            'size_bytes': archive_size,
+            'message': message,
+            'stderr': stderr_text[-1000:],
+            'stdout': stdout_text[-1000:],
+            'target': {
+                'host': target.get('host'),
+                'port': target.get('port'),
+                'user': target.get('user'),
+                'path': target.get('path'),
+            },
+        }
+        return result
+    except subprocess.TimeoutExpired:
+        result = {
+            'success': False,
+            'trigger': trigger,
+            'started_at': started_at,
+            'finished_at': _utcnow_iso(),
+            'duration_seconds': max(0, int(round(time.time() - started_ts))),
+            'archive_name': archive_name,
+            'size_bytes': archive_size,
+            'message': '回传超时（超过 300 秒）',
+        }
+        return result
+    except Exception as e:
+        result = {
+            'success': False,
+            'trigger': trigger,
+            'started_at': started_at,
+            'finished_at': _utcnow_iso(),
+            'duration_seconds': max(0, int(round(time.time() - started_ts))),
+            'archive_name': archive_name,
+            'size_bytes': archive_size,
+            'message': str(e),
+        }
+        return result
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        finished_at = (result or {}).get('finished_at') or _utcnow_iso()
+        updates = {
+            'running': False,
+            'last_finished_at': finished_at,
+            'last_result': result,
+        }
+        if result and result.get('success'):
+            updates['last_success_at'] = finished_at
+        else:
+            updates['last_success_at'] = previous_state.get('last_success_at')
+        _set_auth_sync_state(**updates)
+        auth_sync_run_lock.release()
+
+
+def auth_sync_worker():
+    while True:
+        try:
+            status = get_auth_sync_status()
+            if status.get('enabled') and status.get('available') and status.get('schedule', {}).get('due') and not status.get('running'):
+                perform_auth_sync(trigger='auto')
+        except Exception as e:
+            print(f'[{datetime.now()}] Auth sync worker failed: {e}')
+        time.sleep(15)
+
+
 def _read_file_first_line(path):
     try:
         if os.path.exists(path):
@@ -1011,31 +1665,158 @@ def get_system_info():
 def get_cliproxy_process_usage():
     if not HAS_PSUTIL:
         return {'cpu_percent': 0.0, 'memory_bytes': 0, 'memory_percent': 0.0}
-    target = CONFIG.get('cliproxy_service', 'cliproxy')
+    proc = _find_cliproxy_process()
     cpu_percent = 0.0
     memory_bytes = 0
     memory_percent = 0.0
-    try:
-        for proc in psutil.process_iter(['name', 'cmdline', 'memory_info', 'memory_percent']):
-            name = (proc.info.get('name') or '').lower()
-            cmdline = ' '.join(proc.info.get('cmdline') or []).lower()
-            if target in name or target in cmdline:
-                try:
-                    cpu_percent = proc.cpu_percent(interval=0.0)
-                    mem_info = proc.info.get('memory_info')
-                    if mem_info:
-                        memory_bytes = getattr(mem_info, 'rss', 0)
-                    memory_percent = _safe_float(proc.info.get('memory_percent', 0.0))
-                    break
-                except Exception:
-                    continue
-    except Exception:
-        pass
+    if proc:
+        try:
+            cpu_percent = proc.cpu_percent(interval=0.0)
+            mem_info = proc.memory_info()
+            if mem_info:
+                memory_bytes = getattr(mem_info, 'rss', 0)
+            memory_percent = _safe_float(proc.memory_percent() or 0.0)
+        except Exception:
+            pass
     return {
         'cpu_percent': cpu_percent,
         'memory_bytes': memory_bytes,
         'memory_percent': memory_percent,
     }
+
+
+def _normalize_process_path(path):
+    if not path:
+        return ''
+    try:
+        return os.path.normcase(os.path.normpath(str(path))).lower()
+    except Exception:
+        return str(path).strip().lower()
+
+
+def _matches_cliproxy_process(proc):
+    binary_path = _normalize_process_path(CONFIG.get('cliproxy_binary'))
+    binary_name = os.path.basename(binary_path) if binary_path else ''
+    service_name = str(CONFIG.get('cliproxy_service', '') or '').strip().lower()
+
+    try:
+        name = (proc.name() or '').lower()
+    except Exception:
+        name = ''
+
+    try:
+        cmdline_list = proc.cmdline() or []
+    except Exception:
+        cmdline_list = []
+
+    cmd0 = _normalize_process_path(cmdline_list[0]) if cmdline_list else ''
+
+    if binary_path and (cmd0 == binary_path or name == binary_name):
+        return True
+    if service_name and name == service_name:
+        return True
+    return False
+
+
+def _find_cliproxy_process(preferred_proc=None):
+    if not HAS_PSUTIL:
+        return None
+
+    if preferred_proc:
+        try:
+            if preferred_proc.is_running() and _matches_cliproxy_process(preferred_proc):
+                return preferred_proc
+        except Exception:
+            pass
+
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if _matches_cliproxy_process(proc):
+                    return proc
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def get_auth_file_stats():
+    """统计当前 auth 目录中的凭证文件及常见邮箱域名数量。"""
+    auth_dir = CONFIG.get('auth_dir')
+    if not auth_dir or not os.path.isdir(auth_dir):
+        return {
+            'count': 0,
+            'outlook_count': 0,
+            'hotmail_count': 0,
+            'disabled_count': 0,
+            'invalid_count': 0,
+        }
+
+    try:
+        count = 0
+        outlook_count = 0
+        hotmail_count = 0
+        disabled_count = 0
+        invalid_count = 0
+        now = datetime.now(timezone.utc)
+        for entry in os.listdir(auth_dir):
+            path = os.path.join(auth_dir, entry)
+            if not os.path.isfile(path):
+                continue
+            count += 1
+            name = entry.lower()
+            if name.endswith('@outlook.com.json'):
+                outlook_count += 1
+            elif name.endswith('@hotmail.com.json'):
+                hotmail_count += 1
+
+            is_disabled = False
+            is_invalid = False
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                if data.get('disabled') is True:
+                    is_disabled = True
+
+                status = str(data.get('status', '') or '').strip().lower()
+                if status and status != 'success':
+                    is_invalid = True
+
+                expired = data.get('expired')
+                if isinstance(expired, str) and expired.strip():
+                    try:
+                        expire_at = datetime.fromisoformat(expired.replace('Z', '+00:00'))
+                        if expire_at.tzinfo is None:
+                            expire_at = expire_at.replace(tzinfo=timezone.utc)
+                        if expire_at < now:
+                            is_invalid = True
+                    except Exception:
+                        pass
+            except Exception:
+                is_invalid = True
+
+            if is_disabled:
+                disabled_count += 1
+            elif is_invalid:
+                invalid_count += 1
+
+        return {
+            'count': count,
+            'outlook_count': outlook_count,
+            'hotmail_count': hotmail_count,
+            'disabled_count': disabled_count,
+            'invalid_count': invalid_count,
+        }
+    except Exception:
+        return {
+            'count': 0,
+            'outlook_count': 0,
+            'hotmail_count': 0,
+            'disabled_count': 0,
+            'invalid_count': 0,
+        }
 
 
 def _normalize_quote_text(text):
@@ -1109,6 +1890,12 @@ class ResourceMonitor:
     """非阻塞资源监控器"""
     def __init__(self):
         self._cpu_percent = 0.0
+        self._cliproxy_usage = {
+            'cpu_percent': 0.0,
+            'memory_bytes': 0,
+            'memory_percent': 0.0,
+        }
+        self._cliproxy_process = None
         self._lock = threading.Lock()
         self._running = False
 
@@ -1125,17 +1912,48 @@ class ResourceMonitor:
         while self._running:
             try:
                 if HAS_PSUTIL:
-                    cpu = psutil.cpu_percent(interval=1)  # 1秒采样
+                    cpu = psutil.cpu_percent(interval=None)
+                    proc = _find_cliproxy_process(self._cliproxy_process)
+                    cliproxy_usage = {
+                        'cpu_percent': 0.0,
+                        'memory_bytes': 0,
+                        'memory_percent': 0.0,
+                    }
+                    next_proc = None
+
+                    if proc:
+                        try:
+                            next_proc = proc
+                            mem_info = proc.memory_info()
+                            if mem_info:
+                                cliproxy_usage['memory_bytes'] = getattr(mem_info, 'rss', 0)
+                            cliproxy_usage['memory_percent'] = _safe_float(proc.memory_percent() or 0.0)
+
+                            # 新命中的进程先做一次预热，下一轮开始再返回稳定值。
+                            if self._cliproxy_process is not proc:
+                                proc.cpu_percent(interval=None)
+                            else:
+                                cliproxy_usage['cpu_percent'] = proc.cpu_percent(interval=None)
+                        except Exception:
+                            next_proc = None
+
                     with self._lock:
                         self._cpu_percent = cpu
+                        self._cliproxy_usage = cliproxy_usage
+                        self._cliproxy_process = next_proc
             except:
                 pass
-            time.sleep(2)  # 每3秒更新一次(1秒采样+2秒等待)
+            time.sleep(3)
 
     def get_cpu_percent(self):
         """获取CPU使用率（非阻塞）"""
         with self._lock:
             return self._cpu_percent
+
+    def get_cliproxy_usage(self):
+        """获取后台采样的 cliproxy 进程资源占用。"""
+        with self._lock:
+            return dict(self._cliproxy_usage)
 
 resource_monitor = ResourceMonitor()
 
@@ -1594,21 +2412,18 @@ def get_request_count_from_logs():
             log_state['buffer'] = ''
 
         for line in lines:
-            if '[gin_logger.go' in line and ('POST' in line or 'GET' in line):
-                if any(path in line for path in EXCLUDED_LOG_PATHS):
-                    continue
-                log_state['total'] += 1
-                match = re.search(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', line)
-                if match:
-                    log_state['last_time'] = match.group(1)
-                status_match = re.search(r'\s(\d{3})\s', line)
-                if status_match:
-                    code = int(status_match.group(1))
-                    if 200 <= code < 300:
-                        log_state['success'] += 1
-                    elif code >= 400:
-                        log_state['failed'] += 1
-                changed = True
+            entry = _parse_request_log_entry(line)
+            if not entry:
+                continue
+
+            log_state['total'] += 1
+            log_state['last_time'] = entry.get('time')
+            code = _safe_int(entry.get('status'))
+            if 200 <= code < 300:
+                log_state['success'] += 1
+            elif code >= 400:
+                log_state['failed'] += 1
+            changed = True
 
         log_state['initialized'] = True
         log_state['offset'] = new_offset
@@ -1720,6 +2535,10 @@ def get_idle_state(stats=None):
         stats = get_request_count_from_logs()
 
     last_time_str = stats.get('last_time')
+    if not last_time_str:
+        snapshot = fetch_usage_snapshot()
+        _, usage_reqs = aggregate_usage_snapshot(snapshot)
+        last_time_str = usage_reqs.get('last_time')
     idle_threshold = max(0, int(CONFIG.get('idle_threshold_seconds', 0) or 0))
     result = {
         'is_idle': True,
@@ -2250,14 +3069,7 @@ def parse_journal_logs(service_name, max_lines=100):
         if not message:
             continue
 
-        time_iso = datetime.utcnow().isoformat() + 'Z'
-        ts_raw = item.get('_SOURCE_REALTIME_TIMESTAMP') or item.get('__REALTIME_TIMESTAMP')
-        if ts_raw:
-            try:
-                ts_value = int(str(ts_raw)) / 1_000_000
-                time_iso = datetime.fromtimestamp(ts_value).isoformat() + 'Z'
-            except Exception:
-                pass
+        time_iso = _journal_item_time_iso(item)
 
         logs.append({
             'time': time_iso,
@@ -2268,7 +3080,19 @@ def parse_journal_logs(service_name, max_lines=100):
     return logs[-max_lines:]
 
 
-def merge_log_entries(*groups, limit=200):
+def _journal_item_time_iso(item):
+    time_iso = datetime.utcnow().isoformat() + 'Z'
+    ts_raw = item.get('_SOURCE_REALTIME_TIMESTAMP') or item.get('__REALTIME_TIMESTAMP')
+    if ts_raw:
+        try:
+            ts_value = int(str(ts_raw)) / 1_000_000
+            time_iso = datetime.fromtimestamp(ts_value).isoformat() + 'Z'
+        except Exception:
+            pass
+    return time_iso
+
+
+def merge_log_entries(*groups, limit=200, exclude_localhost=False):
     """合并多个日志来源并按时间排序去重"""
     merged = []
     seen = set()
@@ -2279,6 +3103,8 @@ def merge_log_entries(*groups, limit=200):
                 continue
             message = str(entry.get('message') or '').strip()
             if not message:
+                continue
+            if exclude_localhost and _is_local_log_message(message):
                 continue
             time_value = str(entry.get('time') or '').strip()
             source = str(entry.get('source') or '').strip()
@@ -2316,20 +3142,12 @@ def parse_request_logs(max_lines=200, use_cache=True):
         lines = read_log_tail(log_file, max_lines=max_lines)
 
         logs = []
-        # 使用预编译的正则表达式
         for line in lines:
-            match = REQUEST_LOG_PATTERN.search(line)
-            if match:
-                timestamp, status, duration, client_ip, method, path = match.groups()
-                client_ip = client_ip.strip()
+            entry = _parse_request_log_entry(line)
+            if entry:
                 logs.append({
-                    'time': timestamp,
-                    'status': int(status),
-                    'duration': duration,
-                    'client': client_ip,
-                    'method': method,
-                    'path': path,
-                    'message': f'{method} {path} - {status} ({duration})'
+                    **entry,
+                    'message': f'{entry["method"]} {entry["path"]} - {entry["status"]} ({entry["duration"]})'
                 })
 
         # 统计
@@ -2343,6 +3161,412 @@ def parse_request_logs(max_lines=200, use_cache=True):
     except Exception as e:
         print(f'parse_request_logs error: {e}')
         return [], empty_stats
+
+
+def _normalize_ip_text(value):
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    try:
+        return ipaddress.ip_address(text).compressed
+    except ValueError:
+        return text
+
+
+def _is_local_source_ip(value):
+    normalized = _normalize_ip_text(value)
+    if not normalized:
+        return False
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return normalized.lower() == 'localhost'
+
+
+def _is_local_log_message(message):
+    text = str(message or '').strip()
+    if not text:
+        return False
+
+    entry = _parse_request_log_entry(text)
+    if entry and _is_local_source_ip(entry.get('client')):
+        return True
+
+    lowered = text.lower()
+    return '127.0.0.1' in lowered or 'localhost' in lowered
+
+
+def _build_top_ip_result(items=None, window_requests=0, window_lines=0, source='unknown', source_label='访问日志'):
+    return {
+        'items': items or [],
+        'window_requests': window_requests,
+        'window_lines': window_lines,
+        'source': source,
+        'source_label': source_label,
+    }
+
+
+def _accumulate_ip_entry(per_ip, entry):
+    client_ip = _normalize_ip_text(entry.get('client'))
+    if not client_ip:
+        return
+
+    item = per_ip.setdefault(client_ip, {
+        'ip': client_ip,
+        'count': 0,
+        'success': 0,
+        'failed': 0,
+        'last_seen': None,
+    })
+    item['count'] += 1
+    if _safe_int(entry.get('status')) < 400:
+        item['success'] += 1
+    else:
+        item['failed'] += 1
+    entry_time = entry.get('time')
+    if entry_time and (not item['last_seen'] or entry_time > item['last_seen']):
+        item['last_seen'] = entry_time
+
+
+def _rank_top_ip_items(per_ip, total_requests, limit):
+    ranked = sorted(
+        per_ip.values(),
+        key=lambda item: (item['count'], item['last_seen'] or '', item['ip']),
+        reverse=True
+    )[:limit]
+    for item in ranked:
+        item['share_percent'] = round(item['count'] * 100 / total_requests, 1) if total_requests > 0 else 0.0
+    return ranked
+
+
+def _get_cpa_client_ips_from_journal(max_lines=TOP_CLIENT_LOG_LINES):
+    service_name = str(CONFIG.get('cliproxy_service') or '').strip()
+    if not service_name or not is_linux() or not command_available('journalctl'):
+        return _build_top_ip_result(window_lines=max_lines, source='cpa_journal', source_label='CPA 请求日志')
+
+    safe_unit = shlex.quote(service_name)
+    ok, stdout, _ = run_cmd(
+        f'journalctl -u {safe_unit} -n {int(max_lines)} --no-pager -o json',
+        timeout=20
+    )
+    if not ok or not stdout:
+        return _build_top_ip_result(window_lines=max_lines, source='cpa_journal', source_label='CPA 请求日志')
+
+    per_ip = {}
+    total_requests = 0
+
+    for raw_line in stdout.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            item = json.loads(raw_line)
+        except Exception:
+            continue
+
+        message = str(item.get('MESSAGE') or '').strip()
+        entry = _parse_request_log_entry(message)
+        if not entry:
+            continue
+
+        total_requests += 1
+        _accumulate_ip_entry(per_ip, entry)
+
+    ranked = sorted(
+        per_ip.values(),
+        key=lambda item: (item['count'], item['last_seen'] or '', item['ip']),
+        reverse=True
+    )
+    return _build_top_ip_result(
+        items=ranked,
+        window_requests=total_requests,
+        window_lines=max_lines,
+        source='cpa_journal',
+        source_label='CPA 请求日志',
+    )
+
+
+def _get_cpa_client_ips_from_logs(max_lines=TOP_CLIENT_LOG_LINES):
+    result = _build_top_ip_result(window_lines=max_lines, source='cliproxy_log', source_label='CPA 请求日志')
+    log_file = CONFIG['cliproxy_log']
+    if not os.path.exists(log_file):
+        return result
+
+    try:
+        lines = read_log_tail(log_file, max_lines=max_lines)
+        per_ip = {}
+        total_requests = 0
+
+        for line in lines:
+            entry = _parse_request_log_entry(line)
+            if not entry:
+                continue
+
+            total_requests += 1
+            _accumulate_ip_entry(per_ip, entry)
+
+        return _build_top_ip_result(
+            items=sorted(
+                per_ip.values(),
+                key=lambda item: (item['count'], item['last_seen'] or '', item['ip']),
+                reverse=True
+            ),
+            window_requests=total_requests,
+            window_lines=max_lines,
+            source='cliproxy_log',
+            source_label='CPA 请求日志',
+        )
+    except Exception as e:
+        print(f'_get_cpa_client_ips_from_logs error: {e}')
+        return result
+
+
+def get_cpa_client_ip_stats(max_lines=TOP_CLIENT_LOG_LINES, use_cache=True):
+    cache_key = 'cpa_client_ip_stats'
+    if use_cache:
+        cached = cache.get(cache_key, max_age=IP_MONITOR_CACHE_SECONDS)
+        if cached:
+            return cached
+
+    try:
+        result = _get_cpa_client_ips_from_journal(max_lines=max_lines)
+        if not result.get('items'):
+            result = _get_cpa_client_ips_from_logs(max_lines=max_lines)
+        cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        print(f'get_cpa_client_ip_stats error: {e}')
+        result = _build_top_ip_result(window_lines=max_lines, source='unknown', source_label='CPA 请求日志')
+        cache.set(cache_key, result)
+        return result
+
+
+def get_top_client_ips(limit=TOP_CLIENT_IP_LIMIT, max_lines=TOP_CLIENT_LOG_LINES, use_cache=True):
+    result = get_cpa_client_ip_stats(max_lines=max_lines, use_cache=use_cache)
+    filtered_items = [
+        dict(item)
+        for item in result.get('items', [])
+        if not _is_local_source_ip(item.get('ip'))
+    ]
+    filtered_total_requests = sum(_safe_int(item.get('count', 0)) for item in filtered_items)
+    return {
+        **result,
+        'window_requests': filtered_total_requests,
+        'source_total_clients': len(filtered_items),
+        'items': _rank_top_ip_items(
+            {item['ip']: item for item in filtered_items if item.get('ip')},
+            filtered_total_requests,
+            limit
+        ),
+    }
+
+
+def lookup_ip_location(target, use_cache=True):
+    safe_target = _normalize_ip_text(target)
+    cache_key = f'ip_location:{safe_target}'
+    if use_cache:
+        cached = cache.get(cache_key, max_age=IP_LOCATION_CACHE_SECONDS)
+        if cached:
+            return cached
+
+    result = {
+        'target': safe_target,
+        'label': '未知归属地',
+        'org': '',
+        'message': '',
+    }
+    if not safe_target:
+        result['message'] = '未配置监控 IP'
+        cache.set(cache_key, result)
+        return result
+
+    try:
+        ip_obj = ipaddress.ip_address(safe_target)
+    except ValueError:
+        result['message'] = 'IP 格式无效'
+        cache.set(cache_key, result)
+        return result
+
+    if ip_obj.is_loopback:
+        result['label'] = '本机回环地址'
+        cache.set(cache_key, result)
+        return result
+    if ip_obj.is_private:
+        result['label'] = '内网地址'
+        cache.set(cache_key, result)
+        return result
+    if ip_obj.is_multicast:
+        result['label'] = '组播地址'
+        cache.set(cache_key, result)
+        return result
+    if ip_obj.is_reserved or ip_obj.is_unspecified:
+        result['label'] = '保留地址'
+        cache.set(cache_key, result)
+        return result
+
+    try:
+        resp = requests.get(f'https://ipwho.is/{safe_target}', timeout=4)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError('invalid response')
+        if data.get('success') is False:
+            result['message'] = str(data.get('message') or '查询失败')
+            cache.set(cache_key, result)
+            return result
+
+        country = str(data.get('country') or '').strip()
+        region = str(data.get('region') or '').strip()
+        city = str(data.get('city') or '').strip()
+        connection = data.get('connection') if isinstance(data.get('connection'), dict) else {}
+        org = str(connection.get('org') or connection.get('isp') or '').strip()
+        location_parts = [part for part in [country, region, city] if part]
+        if location_parts:
+            result['label'] = ' / '.join(location_parts)
+        if org:
+            result['org'] = org
+    except Exception as e:
+        result['message'] = f'查询失败: {e}'
+
+    cache.set(cache_key, result)
+    return result
+
+
+def check_ip_connectivity(target, use_cache=True):
+    safe_target = str(target or '').strip()
+    cache_key = f'ip_connectivity:{safe_target}'
+    if use_cache:
+        cached = cache.get(cache_key, max_age=IP_CONNECTIVITY_CACHE_SECONDS)
+        if cached:
+            return cached
+
+    result = {
+        'target': safe_target,
+        'reachable': None,
+        'status': 'unknown',
+        'latency_ms': None,
+        'message': '未检测',
+        'last_checked': datetime.now(timezone.utc).isoformat(),
+    }
+    if not safe_target:
+        result['message'] = '未配置监控 IP'
+        cache.set(cache_key, result)
+        return result
+
+    if not is_linux():
+        result['message'] = '当前仅支持 Linux ping 检测'
+        cache.set(cache_key, result)
+        return result
+
+    if not command_available('ping'):
+        result['message'] = '当前环境不支持 ping'
+        cache.set(cache_key, result)
+        return result
+
+    args = ['ping', '-c', '1', '-W', '1', safe_target]
+    if ':' in safe_target:
+        args.insert(1, '-6')
+
+    try:
+        completed = subprocess.run(args, capture_output=True, text=True, timeout=2)
+        output = '\n'.join(part for part in [completed.stdout, completed.stderr] if part)
+        latency_match = re.search(r'time[=<]\s*([\d.]+)\s*ms', output)
+        if latency_match:
+            result['latency_ms'] = round(_safe_float(latency_match.group(1)), 1)
+
+        if completed.returncode == 0:
+            result['reachable'] = True
+            result['status'] = 'ok'
+            result['message'] = (
+                f'可达，约 {result["latency_ms"]:.1f} ms'
+                if result['latency_ms'] is not None
+                else '可达'
+            )
+        else:
+            result['reachable'] = False
+            result['status'] = 'fail'
+            result['message'] = '不可达'
+    except subprocess.TimeoutExpired:
+        result['reachable'] = False
+        result['status'] = 'fail'
+        result['message'] = 'ping 超时'
+    except Exception as e:
+        result['status'] = 'error'
+        result['message'] = f'检测失败: {e}'
+
+    cache.set(cache_key, result)
+    return result
+
+
+def _build_monitored_target_snapshot(target, stats_map, use_cache=True):
+    normalized = _normalize_ip_text(target)
+    stats = stats_map.get(normalized, {})
+    connectivity = check_ip_connectivity(normalized, use_cache=use_cache)
+    location = lookup_ip_location(normalized, use_cache=use_cache)
+
+    return {
+        **connectivity,
+        'target': normalized,
+        'request_count': _safe_int(stats.get('count', 0)),
+        'success_count': _safe_int(stats.get('success', 0)),
+        'failed_count': _safe_int(stats.get('failed', 0)),
+        'last_seen': stats.get('last_seen'),
+        'location': location.get('label', '未知归属地'),
+        'location_org': location.get('org', ''),
+        'location_message': location.get('message', ''),
+    }
+
+
+def get_ip_monitor_snapshot(use_cache=True):
+    cache_key = 'ip_monitor_snapshot'
+    if use_cache:
+        cached = cache.get(cache_key, max_age=IP_MONITOR_CACHE_SECONDS)
+        if cached:
+            return cached
+
+    all_client_stats = get_cpa_client_ip_stats(use_cache=use_cache)
+    top_clients = get_top_client_ips(use_cache=use_cache)
+    stats_map = {
+        _normalize_ip_text(item.get('ip')): item
+        for item in all_client_stats.get('items', [])
+        if item.get('ip')
+    }
+    monitored_targets, invalid_targets = _parse_monitored_ip_targets()
+    custom_targets = []
+
+    if monitored_targets:
+        with ThreadPoolExecutor(max_workers=min(4, len(monitored_targets))) as executor:
+            futures = [
+                executor.submit(_build_monitored_target_snapshot, target, stats_map, use_cache)
+                for target in monitored_targets
+            ]
+            for future in futures:
+                try:
+                    custom_targets.append(future.result())
+                except Exception as e:
+                    custom_targets.append({
+                        'target': '',
+                        'reachable': None,
+                        'status': 'error',
+                        'latency_ms': None,
+                        'message': f'检测失败: {e}',
+                        'last_checked': datetime.now(timezone.utc).isoformat(),
+                    })
+
+    result = {
+        'top_clients': top_clients.get('items', []),
+        'window_requests': top_clients.get('window_requests', 0),
+        'window_lines': top_clients.get('window_lines', TOP_CLIENT_LOG_LINES),
+        'source': top_clients.get('source', 'unknown'),
+        'source_label': top_clients.get('source_label', '访问日志'),
+        'source_total_clients': top_clients.get('source_total_clients', len(top_clients.get('items', []))),
+        'monitored_targets': monitored_targets,
+        'invalid_targets': invalid_targets,
+        'custom_targets': custom_targets,
+        'ping_supported': is_linux() and command_available('ping'),
+    }
+    cache.set(cache_key, result)
+    return result
 
 def get_paths_info():
     return {
@@ -2460,7 +3684,8 @@ def get_system_resources(use_cache=True):
 
     disk_path = CONFIG.get('disk_path') or '/'
     system_info = get_system_info()
-    cliproxy_usage = get_cliproxy_process_usage()
+    cliproxy_usage = resource_monitor.get_cliproxy_usage()
+    auth_file_stats = get_auth_file_stats()
 
     if not HAS_PSUTIL:
         # 没有psutil时使用命令行获取基本信息
@@ -2468,6 +3693,7 @@ def get_system_resources(use_cache=True):
             'cpu': {'percent': 0, 'cores': 1},
             'memory': {'total': 0, 'used': 0, 'percent': 0, 'available': 0},
             'disk': {'total': 0, 'used': 0, 'percent': 0, 'free': 0, 'path': disk_path},
+            'auth_files': auth_file_stats,
             'network': {'bytes_sent': 0, 'bytes_recv': 0},
             'system': system_info,
             'cliproxy': cliproxy_usage,
@@ -2587,6 +3813,7 @@ def get_system_resources(use_cache=True):
                 'free': disk.free,
                 'path': disk_path,
             },
+            'auth_files': auth_file_stats,
             'network': {
                 'bytes_sent': net_io.bytes_sent,
                 'bytes_recv': net_io.bytes_recv,
@@ -2889,6 +4116,10 @@ def api_status():
     log_requests = get_request_count_from_logs()
     snapshot = fetch_usage_snapshot()
     token_totals, usage_reqs = aggregate_usage_snapshot(snapshot)
+    effective_last_time = log_requests.get('last_time') or usage_reqs.get('last_time')
+    if effective_last_time != log_requests.get('last_time'):
+        log_requests = dict(log_requests)
+        log_requests['last_time'] = effective_last_time
     pricing, pricing_meta = get_effective_pricing()
 
     # 获取当前 CLIProxyAPI 的值
@@ -2991,6 +4222,21 @@ def api_status():
     final_failed = display_failure if display_failure > 0 else log_requests.get('failed', 0)
     idle_state = get_idle_state(log_requests)
     auto_update_state = get_auto_update_state(has_update=has_update, stats=log_requests)
+    ip_monitor = get_ip_monitor_snapshot()
+    auth_sync = get_auth_sync_status()
+    request_windows = aggregate_usage_detail_windows(snapshot, pricing)
+    request_windows['all'] = build_request_stats_payload(
+        REQUEST_STATS_RANGE_META['all']['label'],
+        count=final_count,
+        success=final_success,
+        failed=final_failed,
+        last_time=log_requests.get('last_time'),
+        input_tokens=display_input_tokens,
+        output_tokens=display_output_tokens,
+        cached_tokens=display_cached_tokens,
+        usage_costs=usage_costs,
+        pricing=pricing,
+    )
 
     return jsonify({
         'panel': {
@@ -3031,8 +4277,11 @@ def api_status():
         'pricing_basis': get_pricing_basis_info(),
         'pricing_meta': pricing_meta,
         'usage_costs': usage_costs,
+        'request_windows': request_windows,
         'paths': get_paths_info(),
-        'health': state['health_status']
+        'health': state['health_status'],
+        'ip_monitor': ip_monitor,
+        'auth_sync': auth_sync,
     })
 
 @app.route('/api/logs')
@@ -3043,10 +4292,17 @@ def api_logs():
 @app.route('/api/cliproxy-logs')
 def api_cliproxy_logs():
     """获取 CLIProxy 完整日志"""
+    exclude_localhost = str(request.args.get('exclude_localhost') or '').strip().lower() in ('1', 'true', 'yes', 'on')
     file_logs = parse_log_file(CONFIG['cliproxy_log'], max_lines=400, limit=400)
     stderr_logs = parse_log_file(CONFIG['cliproxy_stderr'], max_lines=120, limit=120)
     journal_logs = parse_journal_logs(CONFIG.get('cliproxy_service'), max_lines=120)
-    logs = merge_log_entries(file_logs, stderr_logs, journal_logs, limit=200)
+    logs = merge_log_entries(
+        file_logs,
+        stderr_logs,
+        journal_logs,
+        limit=200,
+        exclude_localhost=exclude_localhost
+    )
     return jsonify({'logs': logs, 'count': len(logs)})
 
 @app.route('/api/cliproxy-logs/clear', methods=['POST'])
@@ -3069,6 +4325,9 @@ def api_clear_cliproxy_logs():
     _reset_log_stats_state()
     try:
         cache.invalidate('request_count_logs')
+        cache.invalidate('top_client_ips')
+        cache.invalidate('cpa_client_ip_stats')
+        cache.invalidate('ip_monitor_snapshot')
     except Exception:
         pass
 
@@ -3220,6 +4479,107 @@ def api_set_check_interval():
     return jsonify({'success': True, 'check_interval': CONFIG['auto_update_check_interval']})
 
 
+@app.route('/api/config/monitored-ips', methods=['POST'])
+def api_set_monitored_ips():
+    data = request.json or {}
+    raw_targets = data.get('targets', '')
+    targets, invalid = _parse_monitored_ip_targets(raw_targets)
+    if invalid:
+        return jsonify({
+            'success': False,
+            'message': f'以下 IP 格式无效: {", ".join(invalid)}',
+            'invalid': invalid,
+        }), 400
+
+    CONFIG['monitored_ips'] = _format_monitored_ip_targets(targets)
+    _update_dotenv_values({'monitored_ips': CONFIG['monitored_ips']})
+    cache.invalidate('ip_monitor_snapshot')
+    monitor = get_ip_monitor_snapshot(use_cache=False)
+    return jsonify({
+        'success': True,
+        'monitored_ips': monitor.get('monitored_targets', []),
+        'ip_monitor': monitor,
+    })
+
+
+@app.route('/api/auth-sync/status')
+def api_auth_sync_status():
+    return jsonify(get_auth_sync_status())
+
+
+@app.route('/api/config/auth-sync', methods=['POST'])
+def api_set_auth_sync():
+    data = request.json or {}
+    updates = {}
+
+    if 'enabled' in data:
+        updates['auth_sync_enabled'] = _parse_bool(data.get('enabled'))
+
+    if 'interval_seconds' in data or 'interval_minutes' in data:
+        if 'interval_seconds' in data:
+            interval_seconds = _safe_int(data.get('interval_seconds'), 0)
+        else:
+            interval_minutes = _safe_int(data.get('interval_minutes'), 0)
+            interval_seconds = interval_minutes * 60
+        if interval_seconds < 60:
+            return jsonify({'success': False, 'error': '回传间隔不能小于 1 分钟'}), 400
+        updates['auth_sync_interval_seconds'] = interval_seconds
+
+    if 'target_host' in data:
+        updates['auth_sync_target_host'] = str(data.get('target_host') or '').strip()
+    if 'target_port' in data:
+        target_port = _safe_int(data.get('target_port'), 0)
+        if target_port <= 0 or target_port > 65535:
+            return jsonify({'success': False, 'error': 'SSH 端口必须在 1-65535 之间'}), 400
+        updates['auth_sync_target_port'] = target_port
+    if 'target_user' in data:
+        updates['auth_sync_target_user'] = str(data.get('target_user') or '').strip()
+    if 'target_path' in data:
+        updates['auth_sync_target_path'] = str(data.get('target_path') or '').strip()
+    if 'ssh_key_path' in data:
+        updates['auth_sync_ssh_key_path'] = str(data.get('ssh_key_path') or '').strip()
+    if 'strict_host_key_checking' in data:
+        updates['auth_sync_strict_host_key_checking'] = _parse_bool(data.get('strict_host_key_checking'))
+    if 'known_hosts_path' in data:
+        updates['auth_sync_known_hosts_path'] = str(data.get('known_hosts_path') or '').strip()
+    if 'archive_prefix' in data:
+        updates['auth_sync_archive_prefix'] = _safe_archive_prefix(data.get('archive_prefix'))
+
+    for key, value in updates.items():
+        CONFIG[key] = value
+
+    if updates:
+        _update_dotenv_values(updates)
+
+    return jsonify({
+        'success': True,
+        'message': '凭证回传设置已保存',
+        'auth_sync': get_auth_sync_status(),
+    })
+
+
+@app.route('/api/auth-sync/run', methods=['POST'])
+def api_run_auth_sync():
+    if auth_sync_run_lock.locked():
+        return jsonify({'success': False, 'error': '已有凭证回传任务正在执行'}), 400
+
+    validation = validate_auth_sync_config()
+    if not validation.get('valid'):
+        return jsonify({
+            'success': False,
+            'error': validation['errors'][0],
+            'errors': validation['errors'],
+            'warnings': validation.get('warnings', []),
+        }), 400
+
+    thread = threading.Thread(target=perform_auth_sync, kwargs={'trigger': 'manual'}, daemon=True)
+    thread.start()
+    return jsonify({
+        'success': True,
+        'message': '凭证回传任务已启动',
+    }), 202
+
+
 @app.route('/api/config/pricing-auto', methods=['POST'])
 def api_set_pricing_auto():
     """开启/关闭 Token 价格自动同步（默认开启；关闭后严格使用手动价格）"""
@@ -3311,7 +4671,7 @@ def api_record_request():
         state['request_log'].append({
             'time': datetime.now().isoformat(),
             'model': data.get('model', 'unknown'),
-            'client': request.remote_addr,
+            'client': _request_client_ip(),
             'status': data.get('status', 'unknown'),
             'response_time': data.get('response_time', 0)
         })
@@ -3899,6 +5259,8 @@ if __name__ == '__main__':
     load_persistent_stats()
     # 立即保存一次，确保文件存在
     save_persistent_stats(force=True)
+    load_auth_sync_state()
+    save_auth_sync_state()
 
     load_log_stats_state()
     try:
@@ -3923,6 +5285,10 @@ if __name__ == '__main__':
 
     # 启动统计数据持久化线程
     start_persistent_stats_worker()
+
+    # 启动 auth 定时回传线程
+    auth_sync_thread = threading.Thread(target=auth_sync_worker, daemon=True)
+    auth_sync_thread.start()
 
     # 预加载语录并做数量检查
     quotes = load_quotes()

@@ -77,6 +77,30 @@ cp .env.example .env
 - `CLIPROXY_PANEL_CONFIG_WRITE_ENABLED`（默认 `false`；只在你明确接受风险时才开启主配置写回）
 - `CLIPROXY_PANEL_GITHUB_TOKEN`（可选：提高 GitHub 限流额度，减少 `latest=unknown`）
 - `CLIPROXY_PANEL_PRICING_*`（可选：费用估算；默认支持自动同步 OpenRouter 定价，可用 `CLIPROXY_PANEL_PRICING_AUTO_ENABLED=false` 关闭）
+- `CLIPROXY_PANEL_AUTH_SYNC_*`（可选：把 `auth_dir` 定时打包并通过 `scp` 回传到你的 PC）
+
+### 可选：把凭证文件定时传回 PC
+
+面板支持把 `CLIPROXY_PANEL_AUTH_DIR` 指向的凭证目录定时打包成 `tar.gz`，再通过 `scp` 推送到你的电脑。
+
+使用前提：
+- 目标 PC 需要开启 SSH 服务
+- 目标目录需要提前创建好
+- 面板所在机器需要能连到目标 PC 的 SSH 端口
+- 如需免交互定时执行，建议提前配置好 SSH key 或 SSH Agent
+
+对应环境变量：
+- `CLIPROXY_PANEL_AUTH_SYNC_ENABLED=true`
+- `CLIPROXY_PANEL_AUTH_SYNC_INTERVAL_SECONDS=43200`
+- `CLIPROXY_PANEL_AUTH_SYNC_TARGET_HOST=你的PC地址`
+- `CLIPROXY_PANEL_AUTH_SYNC_TARGET_PORT=22`
+- `CLIPROXY_PANEL_AUTH_SYNC_TARGET_USER=你的SSH用户名`
+- `CLIPROXY_PANEL_AUTH_SYNC_TARGET_PATH=/home/yourname/cpa-auth`
+- `CLIPROXY_PANEL_AUTH_SYNC_SSH_KEY_PATH=/root/.ssh/id_ed25519`（可选）
+
+Windows OpenSSH 目标目录建议写成类似 `/C:/Users/你的用户名/Desktop/cpa-auth`。
+
+你也可以直接在面板里的“更新与运维 -> 凭证回传”卡片里保存这些配置，并先点一次“立即回传”验证链路。
 
 ### 4) 启动面板
 ```bash

@@ -62,7 +62,7 @@
   - `CLIPROXY_PANEL_CONFIG_WRITE_ENABLED`：主配置写回开关；默认 `false`，只有你明确接受风险时才改成 `true`
 
 - 费用估算（可选，但建议配置）
-  - `CLIPROXY_PANEL_PRICING_INPUT` / `CLIPROXY_PANEL_PRICING_OUTPUT` / `CLIPROXY_PANEL_PRICING_CACHE`：手动价格（美元/百万Tokens）
+- `CLIPROXY_PANEL_PRICING_INPUT` / `CLIPROXY_PANEL_PRICING_OUTPUT` / `CLIPROXY_PANEL_PRICING_CACHE`：手动价格（USD/Million Tokens）
   - `CLIPROXY_PANEL_PRICING_AUTO_ENABLED`：是否启用自动同步（默认开启；手动价格为 0 时会尝试从 OpenRouter 补齐）
 
 - CLIProxyAPI 对接

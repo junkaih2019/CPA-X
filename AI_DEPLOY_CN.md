@@ -113,7 +113,7 @@ systemctl restart cliproxy-panel
 
 ## 5.1) Token 价格自动同步（OpenRouter）
 
-面板用于“费用估算”的 Token 价格口径是 **美元/百万Tokens**。
+面板用于“费用估算”的 Token 价格口径是 **USD/Million Tokens**。
 
 - 默认开启自动同步：当手动价格为 0 时，面板会从 OpenRouter 获取 `prompt/completion/input_cache_read` 的定价并换算后使用
 - 如需严格使用手动价格：设置 `CLIPROXY_PANEL_PRICING_AUTO_ENABLED=false`（或在页面里关闭“自动同步价格”开关）
